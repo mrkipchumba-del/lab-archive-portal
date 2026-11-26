@@ -7,14 +7,19 @@ export interface LabRecord {
   date: string;
 }
 
-function parseCsvLine(line: string): string[] {
-  const result: string[] = [];
+/**
+ * Full RFC-4180 CSV parser that preserves newlines inside quoted cells
+ * (e.g. multi-line Notes in Google Sheets).
+ */
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
   let current = "";
   let inQuotes = false;
 
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    const next = line[i + 1];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
 
     if (ch === '"') {
       if (inQuotes && next === '"') {
@@ -24,14 +29,31 @@ function parseCsvLine(line: string): string[] {
         inQuotes = !inQuotes;
       }
     } else if (ch === "," && !inQuotes) {
-      result.push(current.trim());
+      row.push(current.trim());
+      current = "";
+    } else if ((ch === "\r" || ch === "\n") && !inQuotes) {
+      if (ch === "\r" && next === "\n") {
+        i++;
+      }
+      row.push(current.trim());
+      if (row.some((cell) => cell.length > 0)) {
+        rows.push(row);
+      }
+      row = [];
       current = "";
     } else {
       current += ch;
     }
   }
-  result.push(current.trim());
-  return result;
+
+  if (current.length > 0 || row.length > 0) {
+    row.push(current.trim());
+    if (row.some((cell) => cell.length > 0)) {
+      rows.push(row);
+    }
+  }
+
+  return rows;
 }
 
 export async function fetchCatalogFromSheet(): Promise<{
@@ -44,7 +66,7 @@ export async function fetchCatalogFromSheet(): Promise<{
   if (!sheetId) {
     return {
       records: [],
-      error: "GOOGLE_SHEET_ID is missing in .env.local",
+      error: "GOOGLE_SHEET_ID is missing in environment variables.",
     };
   }
 
@@ -61,20 +83,31 @@ export async function fetchCatalogFromSheet(): Promise<{
       };
     }
 
+    const contentType = res.headers.get("content-type") || "";
     const text = await res.text();
-    const lines = text
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean);
 
-    if (lines.length <= 1) {
+    // Google returns HTTP 200 with an HTML login page when sheet link-sharing is off
+    if (
+      contentType.includes("text/html") ||
+      text.trimStart().toLowerCase().startsWith("<!doctype html") ||
+      text.trimStart().toLowerCase().startsWith("<html")
+    ) {
+      return {
+        records: [],
+        error:
+          "Google Sheet is restricted. Set sharing on Lab-Archive-Index to 'Anyone with the link → Viewer' (individual Drive files can remain restricted).",
+      };
+    }
+
+    const rows = parseCsv(text);
+    if (rows.length <= 1) {
       return { records: [] };
     }
 
     // Skip row 1 headers (Title, Folder, FileUrl, Tags, Notes, Date)
     const records: LabRecord[] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const cols = parseCsvLine(lines[i]);
+    for (let i = 1; i < rows.length; i++) {
+      const cols = rows[i];
       const title = cols[0] || "";
       const folder = cols[1] || "Uncategorized";
       const fileUrl = cols[2] || "";
@@ -84,14 +117,20 @@ export async function fetchCatalogFromSheet(): Promise<{
 
       if (!title && !fileUrl) continue;
 
+      const uniqueTags = Array.from(
+        new Set(
+          rawTags
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean)
+        )
+      );
+
       records.push({
         title: title || "Untitled Record",
         folder: folder || "Uncategorized",
         fileUrl,
-        tags: rawTags
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean),
+        tags: uniqueTags,
         notes,
         date,
       });

@@ -1,7 +1,13 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import type { LabRecord } from "@/lib/sheet-catalog";
+
+type ViewDensity = "grid" | "compact";
+type SortOption = "date-desc" | "date-asc" | "title-asc";
+
+const VIEW_DENSITY_KEY = "lab_archive_view_density";
+const SORT_OPTION_KEY = "lab_archive_sort_option";
 
 function toPreviewUrl(url: string): string {
   if (!url) return "";
@@ -21,6 +27,43 @@ function getFileIcon(url: string): string {
   return "⚛️";
 }
 
+function parseDateValue(dateStr: string): number {
+  if (!dateStr) return Number.NaN;
+  const trimmed = dateStr.trim();
+
+  // Normalize YYYY-MM-DD as UTC midnight consistently
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const year = Number(isoMatch[1]);
+    const month = Number(isoMatch[2]) - 1;
+    const day = Number(isoMatch[3]);
+    return Date.UTC(year, month, day);
+  }
+
+  const parsed = Date.parse(trimmed);
+  return Number.isNaN(parsed) ? Number.NaN : parsed;
+}
+
+function compareRecords(a: LabRecord, b: LabRecord, sortBy: SortOption): number {
+  if (sortBy === "title-asc") {
+    return a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
+  }
+
+  const timeA = parseDateValue(a.date);
+  const timeB = parseDateValue(b.date);
+  const validA = !Number.isNaN(timeA);
+  const validB = !Number.isNaN(timeB);
+
+  // Push items without valid dates to the bottom regardless of sort direction
+  if (validA && !validB) return -1;
+  if (!validA && validB) return 1;
+  if (validA && validB && timeA !== timeB) {
+    return sortBy === "date-desc" ? timeB - timeA : timeA - timeB;
+  }
+
+  return a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
+}
+
 export default function ArchiveClient({
   records,
   error,
@@ -30,7 +73,82 @@ export default function ArchiveClient({
 }) {
   const [searchTerm, setSearchTerm] = useState("");
   const [selectedFolder, setSelectedFolder] = useState("ALL");
+  const [sortBy, setSortBy] = useState<SortOption>("date-desc");
   const [previewItem, setPreviewItem] = useState<LabRecord | null>(null);
+  const [viewDensity, setViewDensity] = useState<ViewDensity>("grid");
+
+  useEffect(() => {
+    try {
+      const savedDensity = window.localStorage.getItem(VIEW_DENSITY_KEY);
+      if (savedDensity === "grid" || savedDensity === "compact") {
+        setViewDensity(savedDensity);
+      }
+
+      const savedSort = window.localStorage.getItem(SORT_OPTION_KEY);
+      if (
+        savedSort === "date-desc" ||
+        savedSort === "date-asc" ||
+        savedSort === "title-asc"
+      ) {
+        setSortBy(savedSort);
+      }
+    } catch {
+      // Ignore storage errors in restricted browser contexts
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!previewItem) return;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPreviewItem(null);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [previewItem]);
+
+  function handleDensityChange(next: ViewDensity) {
+    setViewDensity(next);
+    try {
+      window.localStorage.setItem(VIEW_DENSITY_KEY, next);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  function handleSortChange(next: SortOption) {
+    setSortBy(next);
+    try {
+      window.localStorage.setItem(SORT_OPTION_KEY, next);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  function handleTagClick(tag: string) {
+    const normalized = tag.toLowerCase();
+    const tokens = searchTerm
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+
+    if (tokens.includes(normalized)) {
+      const remaining = tokens.filter((t) => t !== normalized).join(" ");
+      setSearchTerm(remaining);
+    } else {
+      setSearchTerm(searchTerm.trim() ? `${searchTerm.trim()} ${tag}` : tag);
+    }
+  }
 
   const folders = useMemo(() => {
     const unique = new Set<string>();
@@ -38,36 +156,61 @@ export default function ArchiveClient({
     return Array.from(unique).sort((a, b) => a.localeCompare(b));
   }, [records]);
 
+  const searchTokens = useMemo(
+    () =>
+      searchTerm
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(Boolean),
+    [searchTerm]
+  );
+
   const groupedRecords = useMemo(() => {
-    const term = searchTerm.trim().toLowerCase();
+    const hasSearch = searchTokens.length > 0;
 
     return folders
       .filter((folder) => selectedFolder === "ALL" || folder === selectedFolder)
       .map((folder) => {
-        const folderMatches = term ? folder.toLowerCase().includes(term) : false;
+        const folderLower = folder.toLowerCase();
+        const folderMatchesAllTokens = hasSearch
+          ? searchTokens.every((token) => folderLower.includes(token))
+          : false;
 
-        const matchingItems = records.filter((item) => {
-          const inFolder = (item.folder || "Uncategorized") === folder;
-          if (!inFolder) return false;
-          if (!term) return true;
+        const matchingItems = records
+          .filter((item) => {
+            const inFolder = (item.folder || "Uncategorized") === folder;
+            if (!inFolder) return false;
+            if (!hasSearch) return true;
+            if (folderMatchesAllTokens) return true;
 
-          return (
-            folderMatches ||
-            item.title.toLowerCase().includes(term) ||
-            item.notes.toLowerCase().includes(term) ||
-            item.date.toLowerCase().includes(term) ||
-            item.tags.some((t) => t.toLowerCase().includes(term))
-          );
-        });
+            const itemHaystack = [
+              item.title,
+              item.notes,
+              item.date,
+              item.folder,
+              ...item.tags,
+            ]
+              .join(" ")
+              .toLowerCase();
+
+            return searchTokens.every((token) => itemHaystack.includes(token));
+          })
+          .sort((a, b) => compareRecords(a, b, sortBy));
 
         return {
           folder,
           items: matchingItems,
-          visible: !term || folderMatches || matchingItems.length > 0,
+          visible: !hasSearch || folderMatchesAllTokens || matchingItems.length > 0,
         };
       })
       .filter((group) => group.visible);
-  }, [folders, records, searchTerm, selectedFolder]);
+  }, [folders, records, searchTokens, selectedFolder, sortBy]);
+
+  const totalMatchingItems = useMemo(
+    () => groupedRecords.reduce((sum, group) => sum + group.items.length, 0),
+    [groupedRecords]
+  );
 
   function handleExportJson() {
     const payload = {
@@ -95,13 +238,39 @@ export default function ArchiveClient({
           <span>⚛️</span>
           <span>Personal Lab Archive</span>
         </div>
-        <button
-          type="button"
-          className="btn btn-outline"
-          onClick={handleExportJson}
-        >
-          💾 Export JSON
-        </button>
+
+        <div className="header-actions">
+          <div className="view-toggle" role="group" aria-label="Layout density">
+            <button
+              type="button"
+              className={`btn btn-outline ${
+                viewDensity === "grid" ? "btn-active" : ""
+              }`}
+              onClick={() => handleDensityChange("grid")}
+              aria-pressed={viewDensity === "grid"}
+            >
+              Grid
+            </button>
+            <button
+              type="button"
+              className={`btn btn-outline ${
+                viewDensity === "compact" ? "btn-active" : ""
+              }`}
+              onClick={() => handleDensityChange("compact")}
+              aria-pressed={viewDensity === "compact"}
+            >
+              Compact
+            </button>
+          </div>
+
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={handleExportJson}
+          >
+            💾 Export JSON
+          </button>
+        </div>
       </header>
 
       <main className="portal-main">
@@ -115,12 +284,14 @@ export default function ArchiveClient({
           <input
             type="search"
             className="search-input"
-            placeholder="🔍 Search title, tags, notes, folder, or date..."
+            aria-label="Search lab records by keywords"
+            placeholder="🔍 Search keywords (e.g. arduino manual, prism, 2026)..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
           />
           <select
             className="filter-select"
+            aria-label="Filter by folder"
             value={selectedFolder}
             onChange={(e) => setSelectedFolder(e.target.value)}
           >
@@ -131,7 +302,36 @@ export default function ArchiveClient({
               </option>
             ))}
           </select>
+          <select
+            className="filter-select"
+            aria-label="Sort lab records"
+            value={sortBy}
+            onChange={(e) => handleSortChange(e.target.value as SortOption)}
+          >
+            <option value="date-desc">Newest First</option>
+            <option value="date-asc">Oldest First</option>
+            <option value="title-asc">Title (A–Z)</option>
+          </select>
         </section>
+
+        {(searchTokens.length > 0 || selectedFolder !== "ALL") && (
+          <div className="results-bar">
+            <span className="muted-text">
+              Showing {totalMatchingItems}{" "}
+              {totalMatchingItems === 1 ? "result" : "results"}
+            </span>
+            <button
+              type="button"
+              className="btn btn-outline btn-sm"
+              onClick={() => {
+                setSearchTerm("");
+                setSelectedFolder("ALL");
+              }}
+            >
+              Clear Filters
+            </button>
+          </div>
+        )}
 
         <section className="folder-list">
           {groupedRecords.length === 0 ? (
@@ -151,22 +351,51 @@ export default function ArchiveClient({
                   </span>
                 </summary>
 
-                <div className="doc-grid">
+                <div
+                  className={`doc-grid ${
+                    viewDensity === "compact" ? "doc-grid-compact" : ""
+                  }`}
+                >
                   {items.map((item, idx) => (
-                    <article key={`${item.title}-${idx}`} className="doc-card">
-                      <div>
-                        <div className="doc-thumbnail">
-                          <span>{getFileIcon(item.fileUrl)}</span>
+                    <article
+                      key={`${item.fileUrl || item.title}-${idx}`}
+                      className="doc-card"
+                    >
+                      <div className="doc-body">
+                        {viewDensity === "grid" && (
+                          <div className="doc-thumbnail">
+                            <span>{getFileIcon(item.fileUrl)}</span>
+                          </div>
+                        )}
+                        <div className="doc-title">
+                          {viewDensity === "compact" && (
+                            <span style={{ marginRight: "0.45rem" }}>
+                              {getFileIcon(item.fileUrl)}
+                            </span>
+                          )}
+                          {item.title}
                         </div>
-                        <div className="doc-title">{item.title}</div>
                         {item.notes && <p className="doc-notes">{item.notes}</p>}
                         {item.tags.length > 0 && (
                           <div className="doc-tags">
-                            {item.tags.map((tag) => (
-                              <span key={tag} className="tag-chip">
-                                #{tag}
-                              </span>
-                            ))}
+                            {item.tags.map((tag) => {
+                              const activeTag = searchTokens.includes(
+                                tag.toLowerCase()
+                              );
+                              return (
+                                <button
+                                  key={tag}
+                                  type="button"
+                                  className={`tag-chip ${
+                                    activeTag ? "tag-chip-active" : ""
+                                  }`}
+                                  onClick={() => handleTagClick(tag)}
+                                  title={`Filter by #${tag}`}
+                                >
+                                  #{tag}
+                                </button>
+                              );
+                            })}
                           </div>
                         )}
                         {item.date && (
@@ -207,6 +436,9 @@ export default function ArchiveClient({
       {previewItem && (
         <div
           className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label={previewItem.title}
           onClick={() => setPreviewItem(null)}
         >
           <div
@@ -214,10 +446,10 @@ export default function ArchiveClient({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="preview-header">
-              <div>
-                <h3>{previewItem.title}</h3>
+              <div className="preview-title-wrap">
+                <h3 className="doc-title">{previewItem.title}</h3>
                 {previewItem.notes && (
-                  <p className="muted-text">{previewItem.notes}</p>
+                  <p className="muted-text doc-notes">{previewItem.notes}</p>
                 )}
               </div>
               <div className="preview-actions">
