@@ -8,6 +8,8 @@ type SortOption = "date-desc" | "date-asc" | "title-asc";
 
 const VIEW_DENSITY_KEY = "lab_archive_view_density";
 const SORT_OPTION_KEY = "lab_archive_sort_option";
+const PRIVACY_SHIELD_KEY = "lab_archive_privacy_shield";
+const RESTRICTED_TAGS = new Set(["private", "confidential", "draft", "internal"]);
 
 function toPreviewUrl(url: string): string {
   if (!url) return "";
@@ -27,11 +29,14 @@ function getFileIcon(url: string): string {
   return "⚛️";
 }
 
+function isRestrictedRecord(item: LabRecord): boolean {
+  return item.tags.some((tag) => RESTRICTED_TAGS.has(tag.trim().toLowerCase()));
+}
+
 function parseDateValue(dateStr: string): number {
   if (!dateStr) return Number.NaN;
   const trimmed = dateStr.trim();
 
-  // Normalize YYYY-MM-DD as UTC midnight consistently
   const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (isoMatch) {
     const year = Number(isoMatch[1]);
@@ -54,7 +59,6 @@ function compareRecords(a: LabRecord, b: LabRecord, sortBy: SortOption): number 
   const validA = !Number.isNaN(timeA);
   const validB = !Number.isNaN(timeB);
 
-  // Push items without valid dates to the bottom regardless of sort direction
   if (validA && !validB) return -1;
   if (!validA && validB) return 1;
   if (validA && validB && timeA !== timeB) {
@@ -76,6 +80,9 @@ export default function ArchiveClient({
   const [sortBy, setSortBy] = useState<SortOption>("date-desc");
   const [previewItem, setPreviewItem] = useState<LabRecord | null>(null);
   const [viewDensity, setViewDensity] = useState<ViewDensity>("grid");
+  const [privacyShield, setPrivacyShield] = useState(false);
+  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({});
+  const [collapseResetKey, setCollapseResetKey] = useState(0);
 
   useEffect(() => {
     try {
@@ -91,6 +98,11 @@ export default function ArchiveClient({
         savedSort === "title-asc"
       ) {
         setSortBy(savedSort);
+      }
+
+      const savedShield = window.localStorage.getItem(PRIVACY_SHIELD_KEY);
+      if (savedShield === "true") {
+        setPrivacyShield(true);
       }
     } catch {
       // Ignore storage errors in restricted browser contexts
@@ -134,6 +146,21 @@ export default function ArchiveClient({
     }
   }
 
+  function handlePrivacyToggle() {
+    setPrivacyShield((prev) => {
+      const next = !prev;
+      if (next) {
+        setPreviewItem(null);
+      }
+      try {
+        window.localStorage.setItem(PRIVACY_SHIELD_KEY, String(next));
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+  }
+
   function handleTagClick(tag: string) {
     const normalized = tag.toLowerCase();
     const tokens = searchTerm
@@ -150,11 +177,19 @@ export default function ArchiveClient({
     }
   }
 
+  const accessibleRecords = useMemo(
+    () =>
+      privacyShield
+        ? records.filter((item) => !isRestrictedRecord(item))
+        : records,
+    [records, privacyShield]
+  );
+
   const folders = useMemo(() => {
     const unique = new Set<string>();
-    records.forEach((r) => unique.add(r.folder || "Uncategorized"));
+    accessibleRecords.forEach((r) => unique.add(r.folder || "Uncategorized"));
     return Array.from(unique).sort((a, b) => a.localeCompare(b));
-  }, [records]);
+  }, [accessibleRecords]);
 
   const searchTokens = useMemo(
     () =>
@@ -166,9 +201,9 @@ export default function ArchiveClient({
     [searchTerm]
   );
 
-  const groupedRecords = useMemo(() => {
-    const hasSearch = searchTokens.length > 0;
+  const hasSearch = searchTokens.length > 0;
 
+  const groupedRecords = useMemo(() => {
     return folders
       .filter((folder) => selectedFolder === "ALL" || folder === selectedFolder)
       .map((folder) => {
@@ -177,7 +212,7 @@ export default function ArchiveClient({
           ? searchTokens.every((token) => folderLower.includes(token))
           : false;
 
-        const matchingItems = records
+        const matchingItems = accessibleRecords
           .filter((item) => {
             const inFolder = (item.folder || "Uncategorized") === folder;
             if (!inFolder) return false;
@@ -205,18 +240,30 @@ export default function ArchiveClient({
         };
       })
       .filter((group) => group.visible);
-  }, [folders, records, searchTokens, selectedFolder, sortBy]);
+  }, [folders, accessibleRecords, hasSearch, searchTokens, selectedFolder, sortBy]);
 
   const totalMatchingItems = useMemo(
     () => groupedRecords.reduce((sum, group) => sum + group.items.length, 0),
     [groupedRecords]
   );
 
+  function setAllFoldersOpen(openState: boolean) {
+    const nextState: Record<string, boolean> = {};
+    groupedRecords.forEach(({ folder }) => {
+      nextState[folder] = openState;
+    });
+    setExpandedFolders((prev) => ({ ...prev, ...nextState }));
+    if (!openState) {
+      setCollapseResetKey((k) => k + 1);
+    }
+  }
+
   function handleExportJson() {
     const payload = {
       exportedAt: new Date().toISOString(),
-      totalRecords: records.length,
-      records,
+      privacyShieldActive: privacyShield,
+      totalRecords: accessibleRecords.length,
+      records: accessibleRecords,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: "application/json",
@@ -265,6 +312,16 @@ export default function ArchiveClient({
 
           <button
             type="button"
+            className={`btn btn-outline ${privacyShield ? "btn-shield-active" : ""}`}
+            onClick={handlePrivacyToggle}
+            aria-pressed={privacyShield}
+            title="Hide #private, #confidential, #draft, and #internal items"
+          >
+            {privacyShield ? "🛡️ Shield On" : "🔓 Shield Off"}
+          </button>
+
+          <button
+            type="button"
             className="btn btn-outline"
             onClick={handleExportJson}
           >
@@ -277,6 +334,15 @@ export default function ArchiveClient({
         {error && (
           <div className="alert-error">
             <strong>Sheet Notice:</strong> {error}
+          </div>
+        )}
+
+        {privacyShield && (
+          <div className="privacy-banner" role="status">
+            🛡️ <strong>Privacy Shield active:</strong> Items tagged{" "}
+            <code>#private</code>, <code>#confidential</code>,{" "}
+            <code>#draft</code>, or <code>#internal</code> are hidden from view
+            and JSON exports.
           </div>
         )}
 
@@ -314,121 +380,168 @@ export default function ArchiveClient({
           </select>
         </section>
 
-        {(searchTokens.length > 0 || selectedFolder !== "ALL") && (
-          <div className="results-bar">
-            <span className="muted-text">
-              Showing {totalMatchingItems}{" "}
-              {totalMatchingItems === 1 ? "result" : "results"}
-            </span>
-            <button
-              type="button"
-              className="btn btn-outline btn-sm"
-              onClick={() => {
-                setSearchTerm("");
-                setSelectedFolder("ALL");
-              }}
-            >
-              Clear Filters
-            </button>
+        <div className="results-bar">
+          <span className="muted-text">
+            {hasSearch || selectedFolder !== "ALL"
+              ? `Showing ${totalMatchingItems} ${
+                  totalMatchingItems === 1 ? "result" : "results"
+                } across ${groupedRecords.length} ${
+                  groupedRecords.length === 1 ? "folder" : "folders"
+                }`
+              : `${groupedRecords.length} ${
+                  groupedRecords.length === 1 ? "folder" : "folders"
+                } — tap a folder to view files`}
+          </span>
+
+          <div className="header-actions">
+            {groupedRecords.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  onClick={() => setAllFoldersOpen(true)}
+                >
+                  Expand All
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  onClick={() => setAllFoldersOpen(false)}
+                >
+                  Collapse All
+                </button>
+              </>
+            )}
+            {(hasSearch || selectedFolder !== "ALL") && (
+              <button
+                type="button"
+                className="btn btn-outline btn-sm"
+                onClick={() => {
+                  setSearchTerm("");
+                  setSelectedFolder("ALL");
+                }}
+              >
+                Clear Filters
+              </button>
+            )}
           </div>
-        )}
+        </div>
 
         <section className="folder-list">
           {groupedRecords.length === 0 ? (
             <p className="empty-state">
               {records.length === 0
                 ? "No lab records found yet. Add rows to your Lab-Archive-Index Google Sheet."
-                : "No records match your current search or folder filter."}
+                : "No records match your current search, folder, or privacy filter."}
             </p>
           ) : (
-            groupedRecords.map(({ folder, items }) => (
-              <details key={folder} className="folder-group" open>
-                <summary className="folder-summary">
-                  <span>📁</span>
-                  <span className="folder-name">{folder}</span>
-                  <span className="badge">
-                    {items.length} {items.length === 1 ? "item" : "items"}
-                  </span>
-                </summary>
+            groupedRecords.map(({ folder, items }) => {
+              const isOpen = hasSearch
+                ? true
+                : expandedFolders[folder] ?? false;
 
-                <div
-                  className={`doc-grid ${
-                    viewDensity === "compact" ? "doc-grid-compact" : ""
-                  }`}
+              return (
+                <details
+                  key={`${folder}-${collapseResetKey}`}
+                  className="folder-group"
+                  open={isOpen}
+                  onToggle={(e) => {
+                    if (hasSearch) return;
+                    const nextOpen = (e.currentTarget as HTMLDetailsElement).open;
+                    setExpandedFolders((prev) => ({
+                      ...prev,
+                      [folder]: nextOpen,
+                    }));
+                  }}
                 >
-                  {items.map((item, idx) => (
-                    <article
-                      key={`${item.fileUrl || item.title}-${idx}`}
-                      className="doc-card"
-                    >
-                      <div className="doc-body">
-                        {viewDensity === "grid" && (
-                          <div className="doc-thumbnail">
-                            <span>{getFileIcon(item.fileUrl)}</span>
-                          </div>
-                        )}
-                        <div className="doc-title">
-                          {viewDensity === "compact" && (
-                            <span style={{ marginRight: "0.45rem" }}>
-                              {getFileIcon(item.fileUrl)}
-                            </span>
-                          )}
-                          {item.title}
-                        </div>
-                        {item.notes && <p className="doc-notes">{item.notes}</p>}
-                        {item.tags.length > 0 && (
-                          <div className="doc-tags">
-                            {item.tags.map((tag) => {
-                              const activeTag = searchTokens.includes(
-                                tag.toLowerCase()
-                              );
-                              return (
-                                <button
-                                  key={tag}
-                                  type="button"
-                                  className={`tag-chip ${
-                                    activeTag ? "tag-chip-active" : ""
-                                  }`}
-                                  onClick={() => handleTagClick(tag)}
-                                  title={`Filter by #${tag}`}
-                                >
-                                  #{tag}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        )}
-                        {item.date && (
-                          <div className="doc-meta">Date: {item.date}</div>
-                        )}
-                      </div>
+                  <summary className="folder-summary">
+                    <span>📁</span>
+                    <span className="folder-name">{folder}</span>
+                    <span className="badge">
+                      {items.length} {items.length === 1 ? "item" : "items"}
+                    </span>
+                  </summary>
 
-                      <div className="card-actions">
-                        {item.fileUrl && (
-                          <>
-                            <button
-                              type="button"
-                              className="btn btn-outline"
-                              onClick={() => setPreviewItem(item)}
-                            >
-                              👁️ Preview
-                            </button>
-                            <a
-                              href={item.fileUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="btn btn-outline"
-                            >
-                              ⬇️ Open File
-                            </a>
-                          </>
-                        )}
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              </details>
-            ))
+                  <div
+                    className={`doc-grid ${
+                      viewDensity === "compact" ? "doc-grid-compact" : ""
+                    }`}
+                  >
+                    {items.map((item, idx) => (
+                      <article
+                        key={`${item.fileUrl || item.title}-${idx}`}
+                        className="doc-card"
+                      >
+                        <div className="doc-body">
+                          {viewDensity === "grid" && (
+                            <div className="doc-thumbnail">
+                              <span>{getFileIcon(item.fileUrl)}</span>
+                            </div>
+                          )}
+                          <div className="doc-title">
+                            {viewDensity === "compact" && (
+                              <span style={{ marginRight: "0.45rem" }}>
+                                {getFileIcon(item.fileUrl)}
+                              </span>
+                            )}
+                            {item.title}
+                          </div>
+                          {item.notes && <p className="doc-notes">{item.notes}</p>}
+                          {item.tags.length > 0 && (
+                            <div className="doc-tags">
+                              {item.tags.map((tag) => {
+                                const activeTag = searchTokens.includes(
+                                  tag.toLowerCase()
+                                );
+                                return (
+                                  <button
+                                    key={tag}
+                                    type="button"
+                                    className={`tag-chip ${
+                                      activeTag ? "tag-chip-active" : ""
+                                    }`}
+                                    onClick={() => handleTagClick(tag)}
+                                    title={`Filter by #${tag}`}
+                                  >
+                                    #{tag}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {item.date && (
+                            <div className="doc-meta">Date: {item.date}</div>
+                          )}
+                        </div>
+
+                        <div className="card-actions">
+                          {item.fileUrl && (
+                            <>
+                              <button
+                                type="button"
+                                className="btn btn-outline"
+                                onClick={() => setPreviewItem(item)}
+                              >
+                                👁️ Preview
+                              </button>
+                              <a
+                                href={item.fileUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                referrerPolicy="no-referrer"
+                                className="btn btn-outline"
+                              >
+                                ⬇️ Open File
+                              </a>
+                            </>
+                          )}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </details>
+              );
+            })
           )}
         </section>
       </main>
@@ -457,6 +570,7 @@ export default function ArchiveClient({
                   href={previewItem.fileUrl}
                   target="_blank"
                   rel="noopener noreferrer"
+                  referrerPolicy="no-referrer"
                   className="btn btn-outline"
                 >
                   ↗ Open in Tab
@@ -474,6 +588,7 @@ export default function ArchiveClient({
               src={toPreviewUrl(previewItem.fileUrl)}
               title={previewItem.title}
               className="preview-frame"
+              referrerPolicy="no-referrer"
               allow="autoplay"
             />
           </div>
